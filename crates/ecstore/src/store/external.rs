@@ -17,9 +17,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use http::HeaderMap;
 
 use crate::error::Result;
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use crate::storage_api_contracts::list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info};
+use crate::storage_api_contracts::range::HTTPRangeSpec;
 
 /// Storage driver selected at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,10 +43,11 @@ impl StorageDriver {
     }
 }
 
-/// Bucket-level operations served by the external backend.
+/// Storage operations served by the external backend.
 ///
-/// Object/multipart/list operations are added in later stages (P1b+); they are
-/// intentionally absent here so each stage stays inside its patch budget.
+/// Buckets and single-object read/write/list are covered here. Multipart and
+/// namespace locking are added in later stages; EC-only operations (rebalance,
+/// decommission, heal, scanner) are never routed here.
 #[async_trait]
 pub trait ExternalBackend: Send + Sync + std::fmt::Debug {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
@@ -52,6 +57,43 @@ pub trait ExternalBackend: Send + Sync + std::fmt::Debug {
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
 
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
+
+    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader>;
+
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: Option<String>,
+        incl_deleted: bool,
+    ) -> Result<StorageListObjectsV2Info<ObjectInfo>>;
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<StorageListObjectVersionsInfo<ObjectInfo>>;
 }
 
 static BACKEND: OnceLock<Arc<dyn ExternalBackend>> = OnceLock::new();
@@ -89,6 +131,7 @@ mod tests {
     #[derive(Debug)]
     struct StubBackend {
         buckets: std::sync::Mutex<Vec<String>>,
+        objects: std::sync::Mutex<Vec<(String, usize)>>,
         puts: AtomicUsize,
     }
 
@@ -119,6 +162,78 @@ mod tests {
             buckets.retain(|b| b != bucket);
             Ok(())
         }
+
+        async fn get_object_info(&self, bucket: &str, object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            let buckets = self.buckets.lock().unwrap();
+            if !buckets.iter().any(|b| b == bucket) {
+                return Err(crate::error::Error::BucketNotFound(bucket.to_string()));
+            }
+            if !self.objects.lock().unwrap().iter().any(|(k, _)| k == object) {
+                return Err(crate::error::Error::FileNotFound);
+            }
+            Ok(ObjectInfo::default())
+        }
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            Err(crate::error::Error::NotImplemented)
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            let buckets = self.buckets.lock().unwrap();
+            if !buckets.iter().any(|b| b == bucket) {
+                return Err(crate::error::Error::BucketNotFound(bucket.to_string()));
+            }
+            self.objects.lock().unwrap().push((object.to_string(), 0));
+            Ok(ObjectInfo::default())
+        }
+
+        async fn delete_object(&self, bucket: &str, object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
+            let buckets = self.buckets.lock().unwrap();
+            if !buckets.iter().any(|b| b == bucket) {
+                return Err(crate::error::Error::BucketNotFound(bucket.to_string()));
+            }
+            self.objects.lock().unwrap().retain(|(k, _)| k != object);
+            Ok(ObjectInfo::default())
+        }
+
+        async fn list_objects_v2(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+            _fetch_owner: bool,
+            _start_after: Option<String>,
+            _incl_deleted: bool,
+        ) -> Result<StorageListObjectsV2Info<ObjectInfo>> {
+            Err(crate::error::Error::NotImplemented)
+        }
+
+        async fn list_object_versions(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _marker: Option<String>,
+            _version_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+        ) -> Result<StorageListObjectVersionsInfo<ObjectInfo>> {
+            Err(crate::error::Error::NotImplemented)
+        }
     }
 
     #[test]
@@ -139,6 +254,7 @@ mod tests {
         rt.block_on(async {
             let stub: Arc<dyn ExternalBackend> = Arc::new(StubBackend {
                 buckets: std::sync::Mutex::new(Vec::new()),
+                objects: std::sync::Mutex::new(Vec::new()),
                 puts: AtomicUsize::new(0),
             });
             stub.make_bucket("alpha", &MakeBucketOptions::default()).await.unwrap();
@@ -148,6 +264,21 @@ mod tests {
             assert_eq!(stub.list_bucket(&BucketOptions::default()).await.unwrap().len(), 2);
             stub.delete_bucket("alpha", &DeleteBucketOptions::default()).await.unwrap();
             assert!(stub.get_bucket_info("alpha", &BucketOptions::default()).await.is_err());
+
+            // Object path: bucket must exist, then put/get/delete round-trip.
+            assert!(stub.get_object_info("beta", "k1", &ObjectOptions::default()).await.is_err());
+            assert!(
+                stub.put_object("gamma", "k1", &mut PutObjReader::from_vec(Vec::new()), &ObjectOptions::default())
+                    .await
+                    .is_err()
+            );
+            let mut reader = PutObjReader::from_vec(Vec::new());
+            stub.put_object("beta", "k1", &mut reader, &ObjectOptions::default())
+                .await
+                .unwrap();
+            assert!(stub.get_object_info("beta", "k1", &ObjectOptions::default()).await.is_ok());
+            stub.delete_object("beta", "k1", ObjectOptions::default()).await.unwrap();
+            assert!(stub.get_object_info("beta", "k1", &ObjectOptions::default()).await.is_err());
         });
     }
 }

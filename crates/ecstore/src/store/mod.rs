@@ -1372,6 +1372,9 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        if let Some(backend) = external::backend() {
+            return backend.get_object_reader(bucket, object, range, h, opts).await;
+        }
         let read = self.handle_get_object_reader(bucket, object, range, h, opts);
         #[cfg(feature = "diagnostic-read-version-caller")]
         let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
@@ -1382,6 +1385,9 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend() {
+            return backend.put_object(bucket, object, data, opts).await;
+        }
         self.put_object_with_old_current_size(bucket, object, data, opts)
             .await
             .map(|(object_info, _)| object_info)
@@ -1481,6 +1487,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     type DeletedObject = DeletedObject;
 
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend() {
+            return backend.get_object_info(bucket, object, opts).await;
+        }
         self.handle_get_object_info(bucket, object, opts).await
     }
 
@@ -1530,6 +1539,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend() {
+            return backend.delete_object(bucket, object, opts).await;
+        }
         let result = self.handle_delete_object(bucket, object, opts).await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
@@ -1612,6 +1624,20 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         start_after: Option<String>,
         incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
+        if let Some(backend) = external::backend() {
+            return backend
+                .list_objects_v2(
+                    bucket,
+                    prefix,
+                    continuation_token,
+                    delimiter,
+                    max_keys,
+                    fetch_owner,
+                    start_after,
+                    incl_deleted,
+                )
+                .await;
+        }
         self.inner_list_objects_v2(
             bucket,
             prefix,
@@ -1635,6 +1661,11 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        if let Some(backend) = external::backend() {
+            return backend
+                .list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+                .await;
+        }
         self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
     }
