@@ -430,6 +430,9 @@ mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
 pub(crate) mod delete_recovery_runtime;
+/// PowerFS fork patch: external storage backend injection seam.
+pub mod external;
+pub use external::ExternalBackend;
 mod heal;
 pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
@@ -1430,19 +1433,31 @@ impl BucketOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        if let Some(backend) = external::backend() {
+            return backend.make_bucket(bucket, opts).await;
+        }
         Box::pin(self.handle_make_bucket(bucket, opts)).await
     }
 
     #[instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        if let Some(backend) = external::backend() {
+            return backend.get_bucket_info(bucket, opts).await;
+        }
         self.handle_get_bucket_info(bucket, opts).await
     }
     #[instrument(skip(self))]
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        if let Some(backend) = external::backend() {
+            return backend.list_bucket(opts).await;
+        }
         self.handle_list_bucket(opts).await
     }
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        if let Some(backend) = external::backend() {
+            return backend.delete_bucket(bucket, opts).await;
+        }
         Box::pin(self.handle_delete_bucket(bucket, opts)).await
     }
 }

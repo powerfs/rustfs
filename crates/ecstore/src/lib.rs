@@ -54,6 +54,9 @@ mod services;
 mod set_disk;
 mod storage_api_contracts;
 mod store;
+// PowerFS fork patch: expose the external backend injection seam to the
+// `rustfs` binary crate without opening the rest of `store`.
+pub use store::external::{self as storage_external, ExternalBackend, StorageDriver};
 
 pub use disk::{with_background_disk_io, with_background_resource_unit};
 pub use store::PoolMetaWriteGateStatus;
