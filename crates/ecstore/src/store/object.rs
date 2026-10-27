@@ -4555,6 +4555,13 @@ impl ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<(GetObjectReader, tokio_util::sync::CancellationToken)> {
+        // copy 源读取必须与 GET 同后端：powerfs 桶的对象在 external backend 上，
+        // 走 native 本地盘只会得到 NoSuchKey。外部读为一次性缓冲，
+        // 无可取消流，返回未使用的取消令牌即可。
+        if let Some(backend) = crate::store::external::backend_for_bucket(bucket) {
+            let reader = backend.get_object_reader(bucket, object, range, h, opts).await?;
+            return Ok((reader, tokio_util::sync::CancellationToken::new()));
+        }
         let cancellation = tokio_util::sync::CancellationToken::new();
         let reader = crate::set_disk::with_get_object_read_cancellation(
             cancellation.clone(),

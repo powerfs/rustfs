@@ -73,6 +73,28 @@ pub trait ExternalBackend: Send + Sync + std::fmt::Debug {
 
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
 
+    /// 服务端复制。`src_info` 由 S3 层按 COPY/REPLACE 指令合并好最终元数据，
+    /// 后端据此落盘目标对象；数据是否搬运由后端自行决定。
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo>;
+
+    /// 仅合并元数据（对象锁 legal hold / retention 的 eval_metadata），不动数据。
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
+
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
     async fn list_objects_v2(
         &self,
         bucket: &str,
@@ -149,6 +171,7 @@ mod tests {
     struct StubBackend {
         buckets: std::sync::Mutex<Vec<String>>,
         objects: std::sync::Mutex<Vec<(String, usize)>>,
+        tags: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
         puts: AtomicUsize,
     }
 
@@ -226,6 +249,58 @@ mod tests {
             Ok(ObjectInfo::default())
         }
 
+        async fn copy_object(
+            &self,
+            src_bucket: &str,
+            src_object: &str,
+            dst_bucket: &str,
+            dst_object: &str,
+            _src_info: &mut ObjectInfo,
+            _src_opts: &ObjectOptions,
+            _dst_opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            let buckets = self.buckets.lock().unwrap();
+            if !buckets.iter().any(|b| b == src_bucket) {
+                return Err(crate::error::Error::BucketNotFound(src_bucket.to_string()));
+            }
+            if !buckets.iter().any(|b| b == dst_bucket) {
+                return Err(crate::error::Error::BucketNotFound(dst_bucket.to_string()));
+            }
+            drop(buckets);
+            if !self.objects.lock().unwrap().iter().any(|(k, _)| k == src_object) {
+                return Err(crate::error::Error::FileNotFound);
+            }
+            self.objects.lock().unwrap().push((dst_object.to_string(), 0));
+            Ok(ObjectInfo::default())
+        }
+
+        async fn put_object_metadata(&self, bucket: &str, object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            self.get_object_info(bucket, object, &ObjectOptions::default()).await
+        }
+
+        async fn get_object_tags(&self, bucket: &str, object: &str, _opts: &ObjectOptions) -> Result<String> {
+            Ok(self
+                .tags
+                .lock()
+                .unwrap()
+                .get(&(bucket.to_string(), object.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            self.tags
+                .lock()
+                .unwrap()
+                .insert((bucket.to_string(), object.to_string()), tags.to_string());
+            Ok(ObjectInfo::default())
+        }
+
+        async fn delete_object_tags(&self, bucket: &str, object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            self.tags.lock().unwrap().remove(&(bucket.to_string(), object.to_string()));
+            Ok(ObjectInfo::default())
+        }
+
         async fn list_objects_v2(
             &self,
             _bucket: &str,
@@ -281,6 +356,7 @@ mod tests {
             let stub: Arc<dyn ExternalBackend> = Arc::new(StubBackend {
                 buckets: std::sync::Mutex::new(Vec::new()),
                 objects: std::sync::Mutex::new(Vec::new()),
+                tags: std::sync::Mutex::new(std::collections::HashMap::new()),
                 puts: AtomicUsize::new(0),
             });
             stub.make_bucket("alpha", &MakeBucketOptions::default()).await.unwrap();
@@ -305,6 +381,55 @@ mod tests {
             assert!(stub.get_object_info("beta", "k1", &ObjectOptions::default()).await.is_ok());
             stub.delete_object("beta", "k1", ObjectOptions::default()).await.unwrap();
             assert!(stub.get_object_info("beta", "k1", &ObjectOptions::default()).await.is_err());
+
+            // copy / tagging 契约 round-trip。
+            stub.put_object("beta", "src", &mut PutObjReader::from_vec(Vec::new()), &ObjectOptions::default())
+                .await
+                .unwrap();
+            // 源对象不存在 → FileNotFound；目标桶不存在 → BucketNotFound。
+            stub.copy_object(
+                "beta",
+                "missing",
+                "beta",
+                "dst",
+                &mut ObjectInfo::default(),
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .unwrap_err();
+            stub.copy_object(
+                "beta",
+                "src",
+                "gamma",
+                "dst",
+                &mut ObjectInfo::default(),
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .unwrap_err();
+            stub.copy_object(
+                "beta",
+                "src",
+                "beta",
+                "dst",
+                &mut ObjectInfo::default(),
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert!(stub.get_object_info("beta", "dst", &ObjectOptions::default()).await.is_ok());
+
+            stub.put_object_tags("beta", "dst", "k1=v1", &ObjectOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(stub.get_object_tags("beta", "dst", &ObjectOptions::default()).await.unwrap(), "k1=v1");
+            stub.delete_object_tags("beta", "dst", &ObjectOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(stub.get_object_tags("beta", "dst", &ObjectOptions::default()).await.unwrap(), "");
         });
     }
 }

@@ -1531,6 +1531,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        // 以写入端桶判定后端：powerfs 模式下用户桶的源与目标同在外部后端。
+        if let Some(backend) = external::backend_for_bucket(dst_bucket) {
+            return backend
+                .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                .await;
+        }
         let result = enqueue_transition_after_write(
             self,
             box_copy_object_handler(move || {
@@ -1585,20 +1591,32 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.put_object_metadata(bucket, object, opts).await;
+        }
         self.handle_put_object_metadata(bucket, object, opts).await
     }
     #[instrument(skip(self))]
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.get_object_tags(bucket, object, opts).await;
+        }
         self.handle_get_object_tags(bucket, object, opts).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.put_object_tags(bucket, object, tags, opts).await;
+        }
         self.handle_put_object_tags(bucket, object, tags, opts).await
     }
 
     #[instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.delete_object_tags(bucket, object, opts).await;
+        }
         self.handle_delete_object_tags(bucket, object, opts).await
     }
 
