@@ -1978,8 +1978,52 @@ fn print_license_report(report: &crate::connect::LicenseReport) -> Result<()> {
     Ok(())
 }
 
+/// 存储驱动选择的环境变量；仅 `powerfs` 会安装外部后端。
+const STORAGE_DRIVER_ENV: &str = "RUSTFS_STORAGE_DRIVER";
+
+/// PowerFS fork patch：按 `RUSTFS_STORAGE_DRIVER` 决定是否安装外部后端。
+///
+/// - `native`（默认）：完全不改动现有行为；
+/// - `powerfs`：构造失败直接返回错误，绝不静默回退到本地盘池。
+fn install_powerfs_backend(config: &mut Config) -> Result<()> {
+    let driver = std::env::var(STORAGE_DRIVER_ENV).unwrap_or_default();
+    let driver = driver.trim();
+    if !driver.eq_ignore_ascii_case("powerfs") {
+        return Ok(());
+    }
+
+    let store = powerfs_rustfs_store::PowerFsStore::from_env()
+        .map_err(|err| Error::other(format!("PowerFS backend init failed: {err}")))?;
+    let store_config = store.config().clone();
+    if let Err(existing) = std::sync::Arc::new(store).install() {
+        return Err(Error::other(format!("PowerFS backend already installed: {existing:?}")));
+    }
+
+    // 控制面仍由 ECStore 承担（IAM/系统桶），但只给一个空目录即可；
+    // 单目录不会触发“同一磁盘上的多个目录”校验。
+    if config.volumes.is_empty() {
+        let control_dir = std::env::temp_dir().join(format!("rustfs-powerfs-control-{}", std::process::id()));
+        std::fs::create_dir_all(&control_dir)?;
+        config.volumes = vec![control_dir.to_string_lossy().into_owned()];
+    }
+
+    tracing::info!(
+        target: "rustfs::main::run",
+        storage_driver = "powerfs",
+        filer_endpoints = ?store_config.filer_endpoints,
+        master_endpoints = ?store_config.master_endpoints,
+        collection = %store_config.collection,
+        replication = %store_config.replication,
+        control_volumes = ?config.volumes,
+        "external storage backend installed"
+    );
+    Ok(())
+}
+
 #[instrument(skip(config))]
-async fn run(config: Config) -> Result<()> {
+async fn run(mut config: Config) -> Result<()> {
+    install_powerfs_backend(&mut config)?;
+
     // Single-instance startup threads the process bootstrap context through
     // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
     // multi-instance server constructs its own context here instead.

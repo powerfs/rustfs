@@ -274,6 +274,11 @@ rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
 
+# PowerFS fork patch: external storage backend (needle/volume) driver.
+# Path points at the parent PowerFS repository crate; the fork therefore builds
+# inside the PowerFS tree (where `rustfs/` is a submodule of that repo).
+powerfs-rustfs-store = { path = "../../powerfs-rustfs-store" }
+
 # Connect device identity: P-256 keys, PKCS#10 certificate requests, ES256 proofs.
 p256 = { workspace = true }
 rcgen = { workspace = true }

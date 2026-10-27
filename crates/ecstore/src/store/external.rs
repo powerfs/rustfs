@@ -123,6 +123,23 @@ pub fn is_enabled() -> bool {
     INSTALLED.load(Ordering::Acquire)
 }
 
+/// 系统保留桶（配置、IAM、扫描器状态等）始终留在控制面原生 ECStore 上。
+///
+/// powerfs 模式下外部后端接管用户桶；这些系统桶在启动阶段就要读写
+/// （`config/config.json`、`iam/` 等），如果一并委托，外部存储里没有
+/// 对应桶就会导致 IAM 初始化卡住、S3 一直返回 503。
+pub fn is_control_plane_bucket(bucket: &str) -> bool {
+    bucket == crate::disk::RUSTFS_META_BUCKET || bucket == crate::disk::MIGRATING_META_BUCKET
+}
+
+/// 返回可承接该桶的外部后端；系统桶返回 `None`，走原生 ECStore 路径。
+pub fn backend_for_bucket(bucket: &str) -> Option<&'static Arc<dyn ExternalBackend>> {
+    if is_control_plane_bucket(bucket) {
+        return None;
+    }
+    backend()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +263,15 @@ mod tests {
     fn driver_names_stable() {
         assert_eq!(StorageDriver::Native.as_str(), "native");
         assert_eq!(StorageDriver::PowerFs.as_str(), "powerfs");
+    }
+
+    #[test]
+    fn control_plane_buckets_stay_native() {
+        assert!(is_control_plane_bucket(crate::disk::RUSTFS_META_BUCKET));
+        assert!(is_control_plane_bucket(crate::disk::MIGRATING_META_BUCKET));
+        assert!(!is_control_plane_bucket("user-bucket"));
+        // 未安装后端时，任何桶都不会被委托。
+        assert!(backend_for_bucket("user-bucket").is_none());
     }
 
     #[test]

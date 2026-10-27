@@ -1372,7 +1372,7 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend.get_object_reader(bucket, object, range, h, opts).await;
         }
         let read = self.handle_get_object_reader(bucket, object, range, h, opts);
@@ -1385,7 +1385,7 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend.put_object(bucket, object, data, opts).await;
         }
         self.put_object_with_old_current_size(bucket, object, data, opts)
@@ -1407,6 +1407,14 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        // S3 PUT 处理器直接调用本方法（不经 trait `put_object`），因此这里
+        // 也要委托，否则 powerfs 模式下对象会被写进控制面 ECStore。
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            let object_info = backend.put_object(bucket, object, data, opts).await?;
+            let object_info = enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, opts).await?;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
+            return Ok((object_info, None));
+        }
         let result = match self.handle_put_object(bucket, object, data, opts).await {
             Ok((object_info, old_current_size)) => {
                 enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, opts)
@@ -1439,15 +1447,20 @@ impl BucketOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        if let Some(backend) = external::backend() {
-            return backend.make_bucket(bucket, opts).await;
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            // 外部后端负责用户桶命名空间；控制面仍需桶元数据
+            // （versioning/quota/object-lock 等由 BucketMetadataSys 从
+            // `.rustfs.sys/buckets/<bucket>` 读取），因此随后在控制面
+            // 也建桶。两步都成功才算建桶完成。
+            backend.make_bucket(bucket, opts).await?;
+            return Box::pin(self.handle_make_bucket(bucket, opts)).await;
         }
         Box::pin(self.handle_make_bucket(bucket, opts)).await
     }
 
     #[instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend.get_bucket_info(bucket, opts).await;
         }
         self.handle_get_bucket_info(bucket, opts).await
@@ -1461,8 +1474,10 @@ impl BucketOperations for ECStore {
     }
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        if let Some(backend) = external::backend() {
-            return backend.delete_bucket(bucket, opts).await;
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            // 先删外部命名空间（含非空校验），再删控制面的桶元数据。
+            backend.delete_bucket(bucket, opts).await?;
+            return Box::pin(self.handle_delete_bucket(bucket, opts)).await;
         }
         Box::pin(self.handle_delete_bucket(bucket, opts)).await
     }
@@ -1487,13 +1502,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     type DeletedObject = DeletedObject;
 
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend.get_object_info(bucket, object, opts).await;
         }
         self.handle_get_object_info(bucket, object, opts).await
     }
 
     async fn get_object_info_for_delete(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        // 删除前置查询必须与写入端走同一个后端，否则 powerfs 桶会被当成不存在。
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.get_object_info(bucket, object, opts).await;
+        }
         ECStore::get_object_info_for_delete(self, bucket, object, opts).await
     }
 
@@ -1539,7 +1558,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend.delete_object(bucket, object, opts).await;
         }
         let result = self.handle_delete_object(bucket, object, opts).await;
@@ -1624,7 +1643,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         start_after: Option<String>,
         incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend
                 .list_objects_v2(
                     bucket,
@@ -1661,7 +1680,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        if let Some(backend) = external::backend() {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
             return backend
                 .list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
                 .await;

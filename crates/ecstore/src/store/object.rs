@@ -5190,6 +5190,11 @@ impl ECStore {
         opts: ObjectOptions,
         guards: impl IntoIterator<Item = rustfs_lock::NamespaceLockGuard>,
     ) -> Result<ObjectInfo> {
+        // S3 DELETE 处理器直接调用本固有方法，外部后端（powerfs 桶）
+        // 必须与 trait `delete_object` 一样在此委托。
+        if let Some(backend) = crate::store::external::backend_for_bucket(bucket) {
+            return backend.delete_object(bucket, object, opts).await;
+        }
         let guards = Arc::new(guards.into_iter().collect::<Vec<_>>());
         let mut opts = opts;
         opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), guards.clone())));
@@ -5232,6 +5237,35 @@ impl ECStore {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        // S3 批量删除（POST ?delete）直接调用本固有方法，外部后端（powerfs 桶）
+        // 在此循环复用单对象委托；不存在的键按 S3 语义视为删除成功。
+        if let Some(backend) = crate::store::external::backend_for_bucket(bucket) {
+            let count = objects.len();
+            let mut deleted = Vec::with_capacity(count);
+            let mut errors: Vec<Option<Error>> = Vec::with_capacity(count);
+            let mut accounting: Vec<Option<DeleteAccounting>> = Vec::with_capacity(count);
+            for object in objects {
+                // S3 语义：删除不存在的键视为成功。
+                let outcome = match backend.delete_object(bucket, &object.object_name, opts.clone()).await {
+                    Ok(_) => None,
+                    Err(Error::ObjectNotFound(_, _)) => None,
+                    Err(error) => Some(error),
+                };
+                if outcome.is_none() {
+                    deleted.push(DeletedObject {
+                        object_name: object.object_name,
+                        found: true,
+                        ..Default::default()
+                    });
+                    errors.push(None);
+                } else {
+                    deleted.push(DeletedObject::default());
+                    errors.push(outcome);
+                }
+                accounting.push(None);
+            }
+            return (deleted, errors, accounting);
+        }
         let store = Arc::clone(self);
         let bucket = bucket.to_owned();
         let object_count = objects.len();
