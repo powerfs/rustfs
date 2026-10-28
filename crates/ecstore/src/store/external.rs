@@ -23,6 +23,9 @@ use crate::error::Result;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use crate::storage_api_contracts::list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info};
+use crate::storage_api_contracts::multipart::{
+    CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo,
+};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 
 /// Storage driver selected at startup.
@@ -118,6 +121,64 @@ pub trait ExternalBackend: Send + Sync + std::fmt::Debug {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<StorageListObjectVersionsInfo<ObjectInfo>>;
+
+    // --- Multipart -------------------------------------------------------
+    //
+    // UploadPartCopy 不在此契约内：上游 `copy_object_part` 本身返回
+    // NotImplemented，S3 层用「读源 + put_object_part」自行实现。
+
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
+
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo>;
+
+    async fn get_multipart_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<MultipartInfo>;
+
+    #[allow(clippy::too_many_arguments)] // 与 native list_object_parts 签名保持一致
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo>;
+
+    async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
+
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo>;
+
+    #[allow(clippy::too_many_arguments)] // 与 native list_multipart_uploads 签名保持一致
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+    ) -> Result<ListMultipartsInfo>;
 }
 
 static BACKEND: OnceLock<Arc<dyn ExternalBackend>> = OnceLock::new();
@@ -174,6 +235,8 @@ mod tests {
         buckets: std::sync::Mutex<Vec<String>>,
         objects: std::sync::Mutex<Vec<(String, usize)>>,
         tags: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
+        parts: std::sync::Mutex<std::collections::HashMap<(String, usize), usize>>,
+        next_upload_id: AtomicUsize,
         puts: AtomicUsize,
     }
 
@@ -328,6 +391,128 @@ mod tests {
         ) -> Result<StorageListObjectVersionsInfo<ObjectInfo>> {
             Err(crate::error::Error::NotImplemented)
         }
+
+        async fn new_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<MultipartUploadResult> {
+            let id = self.next_upload_id.fetch_add(1, Ordering::SeqCst).to_string();
+            Ok(MultipartUploadResult {
+                upload_id: id,
+                checksum_algo: None,
+                checksum_type: None,
+            })
+        }
+
+        async fn put_object_part(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            upload_id: &str,
+            part_id: usize,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<PartInfo> {
+            self.parts.lock().unwrap().insert((upload_id.to_string(), part_id), 0);
+            Ok(PartInfo {
+                part_num: part_id,
+                ..PartInfo::default()
+            })
+        }
+
+        async fn get_multipart_info(
+            &self,
+            bucket: &str,
+            object: &str,
+            upload_id: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<MultipartInfo> {
+            Ok(MultipartInfo {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                upload_id: upload_id.to_string(),
+                ..MultipartInfo::default()
+            })
+        }
+
+        async fn list_object_parts(
+            &self,
+            bucket: &str,
+            object: &str,
+            upload_id: &str,
+            _part_number_marker: Option<usize>,
+            _max_parts: usize,
+            _opts: &ObjectOptions,
+        ) -> Result<ListPartsInfo> {
+            let parts = self
+                .parts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((id, _), _)| id == upload_id)
+                .map(|((_, number), _)| PartInfo {
+                    part_num: *number,
+                    ..PartInfo::default()
+                })
+                .collect();
+            Ok(ListPartsInfo {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                upload_id: upload_id.to_string(),
+                parts,
+                ..ListPartsInfo::default()
+            })
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            upload_id: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<()> {
+            self.parts.lock().unwrap().retain(|(id, _), _| id != upload_id);
+            Ok(())
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            upload_id: &str,
+            uploaded_parts: Vec<CompletePart>,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            if !self.parts.lock().unwrap().iter().any(|((id, _), _)| id == upload_id) {
+                return Err(crate::error::Error::InvalidUploadID(upload_id.to_string(), String::new(), String::new()));
+            }
+            if uploaded_parts.is_empty() {
+                return Err(crate::error::Error::InvalidPart(0, String::new(), String::new()));
+            }
+            // 完成即销毁会话（与真实后端一致），重放同一 upload_id 应失败。
+            self.parts.lock().unwrap().retain(|(id, _), _| id != upload_id);
+            Ok(ObjectInfo::default())
+        }
+
+        async fn list_multipart_uploads(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            key_marker: Option<String>,
+            upload_id_marker: Option<String>,
+            delimiter: Option<String>,
+            max_uploads: usize,
+        ) -> Result<ListMultipartsInfo> {
+            Ok(ListMultipartsInfo {
+                key_marker,
+                upload_id_marker,
+                max_uploads,
+                delimiter,
+                ..ListMultipartsInfo::default()
+            })
+        }
     }
 
     #[test]
@@ -359,6 +544,8 @@ mod tests {
                 buckets: std::sync::Mutex::new(Vec::new()),
                 objects: std::sync::Mutex::new(Vec::new()),
                 tags: std::sync::Mutex::new(std::collections::HashMap::new()),
+                parts: std::sync::Mutex::new(std::collections::HashMap::new()),
+                next_upload_id: AtomicUsize::new(1),
                 puts: AtomicUsize::new(0),
             });
             stub.make_bucket("alpha", &MakeBucketOptions::default()).await.unwrap();
@@ -432,6 +619,72 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stub.get_object_tags("beta", "dst", &ObjectOptions::default()).await.unwrap(), "");
+
+            // multipart 契约 round-trip：创建会话 → 上传分块 → 列举 → 完成 / 中止。
+            let upload = stub
+                .new_multipart_upload("beta", "mp", &ObjectOptions::default())
+                .await
+                .unwrap();
+            assert!(!upload.upload_id.is_empty());
+            assert!(
+                stub.get_multipart_info("beta", "mp", &upload.upload_id, &ObjectOptions::default())
+                    .await
+                    .is_ok()
+            );
+            stub.put_object_part(
+                "beta",
+                "mp",
+                &upload.upload_id,
+                1,
+                &mut PutObjReader::from_vec(Vec::new()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .unwrap();
+            let listed = stub
+                .list_object_parts("beta", "mp", &upload.upload_id, None, 1000, &ObjectOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(listed.parts.len(), 1);
+            let completed = stub
+                .complete_multipart_upload(
+                    "beta",
+                    "mp",
+                    &upload.upload_id,
+                    vec![CompletePart {
+                        part_num: 1,
+                        ..CompletePart::default()
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(completed.size, 0);
+            // 完成后再完成同一会话 → InvalidUploadID（分块已被清理语义）。
+            assert!(
+                stub.complete_multipart_upload(
+                    "beta",
+                    "mp",
+                    &upload.upload_id,
+                    vec![CompletePart {
+                        part_num: 1,
+                        ..CompletePart::default()
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .is_err()
+            );
+            // 无分块会话的 abort 不报错。
+            let second = stub
+                .new_multipart_upload("beta", "mp2", &ObjectOptions::default())
+                .await
+                .unwrap();
+            stub.abort_multipart_upload("beta", "mp2", &second.upload_id, &ObjectOptions::default())
+                .await
+                .unwrap();
+            let listing = stub.list_multipart_uploads("beta", "", None, None, None, 1000).await.unwrap();
+            assert!(!listing.is_truncated);
         });
     }
 }

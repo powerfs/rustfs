@@ -515,6 +515,20 @@ impl ECStore {
             &request.upload_id_marker,
             &request.delimiter,
         )?;
+        // 外部后端（powerfs）桶的分段上传会话保存在后端自己的隐藏存储里，
+        // native 的 set_disk 列表只读本地盘，会返回空结果并丢掉 Uploads。
+        if let Some(backend) = crate::store::external::backend_for_bucket(bucket) {
+            return backend
+                .list_multipart_uploads(
+                    bucket,
+                    &request.prefix,
+                    request.key_marker.clone(),
+                    request.upload_id_marker.clone(),
+                    request.delimiter.clone(),
+                    request.max_uploads,
+                )
+                .await;
+        }
         let guard_opts = ObjectOptions {
             expected_bucket_incarnation_id: request.expected_incarnation_id,
             ..Default::default()

@@ -1742,6 +1742,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend
+                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+                .await;
+        }
         self.handle_list_multipart_uploads(
             bucket,
             multipart::MultipartUploadListRequest {
@@ -1758,6 +1763,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.new_multipart_upload(bucket, object, opts).await;
+        }
         self.handle_new_multipart_upload(bucket, object, opts).await
     }
 
@@ -1801,6 +1809,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.put_object_part(bucket, object, upload_id, part_id, data, opts).await;
+        }
         self.handle_put_object_part(bucket, object, upload_id, part_id, data, opts)
             .await
     }
@@ -1813,6 +1824,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         upload_id: &str,
         opts: &ObjectOptions,
     ) -> Result<MultipartInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.get_multipart_info(bucket, object, upload_id, opts).await;
+        }
         self.handle_get_multipart_info(bucket, object, upload_id, opts).await
     }
 
@@ -1826,12 +1840,20 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         max_parts: usize,
         opts: &ObjectOptions,
     ) -> Result<ListPartsInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend
+                .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+                .await;
+        }
         self.handle_list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
             .await
     }
 
     #[instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            return backend.abort_multipart_upload(bucket, object, upload_id, opts).await;
+        }
         self.handle_abort_multipart_upload(bucket, object, upload_id, opts).await
     }
 
@@ -1844,6 +1866,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        if let Some(backend) = external::backend_for_bucket(bucket) {
+            // 外部后端不参与 ECStore 的 lifecycle transition 队列与 scanner
+            // 新命名空间信号；对象在本进程内已落盘完成。
+            return backend
+                .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+                .await;
+        }
         let result = enqueue_transition_after_write(
             self.as_ref(),
             self.clone()

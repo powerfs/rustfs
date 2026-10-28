@@ -1815,12 +1815,32 @@ impl DefaultMultipartUsecase {
             .into());
         }
 
-        let prepared_source = store
-            .prepare_get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
-            .await
-            .map_err(map_get_object_reader_error)?;
+        // 外部后端（powerfs）桶的源对象元数据与数据都在外部后端：native 的
+        // `prepare_get_object_reader` 只读本地盘，会误报 NoSuchKey。外部读为
+        // 一次性缓冲，无可取消流，返回未使用的取消令牌即可。
+        let (src_info, src_stream, _source_cancellation) =
+            if let Some(backend) = rustfs_ecstore::storage_external::backend_for_bucket(&src_bucket) {
+                let reader = backend
+                    .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+                    .await
+                    .map_err(map_get_object_reader_error)?;
+                let info = reader.object_info.clone();
+                // 外部读为一次性缓冲，无可取消流，故无需取消守卫。
+                let cancellation: Option<tokio_util::sync::DropGuard> = None;
+                (info, reader.stream, cancellation)
+            } else {
+                let prepared_source = store
+                    .prepare_get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+                    .await
+                    .map_err(map_get_object_reader_error)?;
+                let info = prepared_source.object_info().clone();
+                let (src_reader, cancellation) = prepared_source
+                    .into_reader_for_copy()
+                    .await
+                    .map_err(map_get_object_reader_error)?;
+                (info, src_reader.stream, Some(cancellation))
+            };
 
-        let src_info = prepared_source.object_info();
         if src_info.delete_marker {
             let error = if src_opts.version_id.is_none() {
                 StorageError::ObjectNotFound(src_bucket.clone(), src_key.clone())
@@ -1834,7 +1854,8 @@ impl DefaultMultipartUsecase {
         // read resolves its material inside the object layer, which carries no request identity.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
-        let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
+        let resolved_src_version_id =
+            format_copy_source_version_id(src_info.version_id.clone(), src_versioned, src_version_suspended);
 
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -1894,11 +1915,6 @@ impl DefaultMultipartUsecase {
                 ));
             }
         };
-        let (src_reader, _source_cancellation) = prepared_source
-            .into_reader_for_copy()
-            .await
-            .map_err(map_get_object_reader_error)?;
-        let src_stream = src_reader.stream;
 
         let is_disk_compressed =
             rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);

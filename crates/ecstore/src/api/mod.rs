@@ -566,6 +566,9 @@ pub mod object {
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
         SnapshotConsistencyError,
     };
+    /// 外部后端需要按分块构造 `ObjectInfo::parts`（partNumber GET 依赖它
+    /// 计算各分块区间），因此把该类型一并暴露。
+    pub use rustfs_filemeta::ObjectPartInfo;
 
     #[cfg(feature = "test-util")]
     pub mod test_util {
