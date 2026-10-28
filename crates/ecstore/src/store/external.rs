@@ -75,6 +75,7 @@ pub trait ExternalBackend: Send + Sync + std::fmt::Debug {
 
     /// 服务端复制。`src_info` 由 S3 层按 COPY/REPLACE 指令合并好最终元数据，
     /// 后端据此落盘目标对象；数据是否搬运由后端自行决定。
+    #[allow(clippy::too_many_arguments)] // 参数个数由 S3 copy 契约决定
     async fn copy_object(
         &self,
         src_bucket: &str,
@@ -95,6 +96,7 @@ pub trait ExternalBackend: Send + Sync + std::fmt::Debug {
 
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 
+    #[allow(clippy::too_many_arguments)] // 与 native list_objects_v2 签名保持一致
     async fn list_objects_v2(
         &self,
         bucket: &str,
